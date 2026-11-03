@@ -1,0 +1,186 @@
+import numpy as np
+import pandas as pd
+import torch
+import dgl
+from tqdm import tqdm
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from utils import (
+    find_topic_csv, parse_popularity, safe_read_csv, get_user_ids,
+    normalize_topic_name, to_numeric_series, minmax_norm_array,
+    load_npy_by_post_id, load_topic_embedding, make_fixed_dim,
+    auth_to_id, member_type_to_id, one_hot, log1p_norm, minmax_norm
+)
+
+def build_video_feature(topic_dir: Path, post_id: str, video_dim: int) -> np.ndarray:
+    return make_fixed_dim(load_npy_by_post_id(topic_dir / "videoembedding", post_id), video_dim)
+
+
+def build_image_feature(topic_dir: Path, post_id: str, image_dim: int) -> np.ndarray:
+    """图片模态节点特征：<话题>/imageembedding/<帖子id>.npy（ViT CLS 768 维，多图平均融合）。"""
+    return make_fixed_dim(load_npy_by_post_id(topic_dir / "imageembedding", post_id), image_dim)
+
+def build_audio_feature(topic_dir: Path, post_id: str, audio_dim: int) -> np.ndarray:
+    return make_fixed_dim(load_npy_by_post_id(topic_dir / "audioembedding", post_id), audio_dim)
+
+def build_text_feature(topic_dir: Path, post_id: str, text_dim: int) -> np.ndarray:
+    vec = None
+    for fn in ["textembedding", "text_embeddings", "bertembedding", "contextembedding"]:
+        vec = load_npy_by_post_id(topic_dir / fn, post_id)
+        if vec is not None:
+            break
+    return make_fixed_dim(vec, text_dim)
+
+
+def build_post_feature_from_row(row: pd.Series, post_weight: float = 0.0) -> np.ndarray:
+    def has_non_empty(names):
+        for name in names:
+            if name in row.index:
+                s = str(row[name]).strip()
+                if s not in ["", "nan", "None", "NaN"]:
+                    return 1.0
+        return 0.0
+    def get_text_len(names):
+        for name in names:
+            if name in row.index:
+                return float(len(str(row[name])))
+        return 0.0
+    has_video = has_non_empty(["微博视频url", "video_url", "视频url"])
+    has_image = has_non_empty(["微博图片url", "image_url", "图片url"])
+    text_len_raw = get_text_len(["微博正文", "正文", "content", "text"])
+    has_text = 1.0 if text_len_raw > 0 else 0.0
+    return np.array([1.0, float(post_weight), has_video, has_image, has_text, np.log1p(text_len_raw)], dtype=np.float32)
+
+def build_user_feature_from_rows(user_rows: pd.DataFrame) -> np.ndarray:
+    follow = float(np.mean(log1p_norm(to_numeric_series(user_rows, ["关注数", "关注", "follow_count", "friends_count", "用户关注数"])))) if len(user_rows) else 0.0
+    fans = float(np.mean(log1p_norm(to_numeric_series(user_rows, ["粉丝数", "粉丝", "followers_count", "followers", "用户粉丝数"])))) if len(user_rows) else 0.0
+    user_reposts = float(np.mean(log1p_norm(to_numeric_series(user_rows, ["用户转发数", "user_repost_count", "博主转发数", "主页转发数"])))) if len(user_rows) else 0.0
+    user_comments = float(np.mean(log1p_norm(to_numeric_series(user_rows, ["用户评论数", "user_comment_count", "博主评论数", "主页评论数"])))) if len(user_rows) else 0.0
+    user_likes = float(np.mean(log1p_norm(to_numeric_series(user_rows, ["用户点赞数", "user_like_count", "博主点赞数", "主页点赞数"])))) if len(user_rows) else 0.0
+    if "user_authentication" in user_rows.columns:
+        auth_id = auth_to_id(user_rows["user_authentication"].iloc[0])
+    elif "认证" in user_rows.columns:
+        auth_id = auth_to_id(user_rows["认证"].iloc[0])
+    else:
+        auth_id = 0
+    if "会员类型" in user_rows.columns:
+        member_id = member_type_to_id(user_rows["会员类型"].iloc[0])
+    elif "会员" in user_rows.columns:
+        member_id = member_type_to_id(user_rows["会员"].iloc[0])
+    else:
+        member_id = 0
+    vip = float(np.mean(minmax_norm(to_numeric_series(user_rows, ["会员等级", "vip_level", "用户会员等级"])))) if len(user_rows) else 0.0
+    base = np.array([follow, fans, user_reposts, user_comments, user_likes, vip], dtype=np.float32)
+    return np.concatenate([base, one_hot(np.array([auth_id]), 6)[0], one_hot(np.array([member_id]), 4)[0]], axis=0).astype(np.float32)
+
+def build_topic_feature(df: pd.DataFrame, user_count: int, topic_dir: Path, topic_sem_dim: int) -> np.ndarray:
+    post_count = len(df)
+    if "entropy_score" in df.columns:
+        post_weight = pd.to_numeric(df["entropy_score"], errors="coerce").fillna(0).values.astype(np.float32)
+    elif "post_weight" in df.columns:
+        post_weight = pd.to_numeric(df["post_weight"], errors="coerce").fillna(0).values.astype(np.float32)
+    else:
+        post_weight = np.zeros(post_count, dtype=np.float32)
+    post_weight_norm = minmax_norm_array(post_weight) if len(post_weight) else post_weight
+    mean_weight = float(np.mean(post_weight_norm)) if len(post_weight_norm) else 0.0
+    max_weight = float(np.max(post_weight_norm)) if len(post_weight_norm) else 0.0
+    std_weight = float(np.std(post_weight_norm)) if len(post_weight_norm) else 0.0
+    repost = to_numeric_series(df, ["转发数", "reposts", "repost_count"])
+    comment = to_numeric_series(df, ["评论数", "comments", "comment_count"])
+    like = to_numeric_series(df, ["点赞数", "likes", "like_count"])
+    avg_text_len = float(np.log1p(df["微博正文"].fillna("").astype(str).apply(len).mean())) if "微博正文" in df.columns else 0.0
+    stat_feat = np.array([1.0, np.log1p(post_count), np.log1p(user_count), mean_weight, max_weight, std_weight,
+                     float(np.log1p(repost.clip(lower=0).mean())), float(np.log1p(comment.clip(lower=0).mean())), float(np.log1p(like.clip(lower=0).mean())),
+                     float(np.log1p(repost.clip(lower=0).max())), float(np.log1p(comment.clip(lower=0).max())), float(np.log1p(like.clip(lower=0).max())),
+                     avg_text_len, float((repost > 0).mean()) if len(repost) else 0.0, float((comment > 0).mean()) if len(comment) else 0.0], dtype=np.float32)
+    topic_sem = load_topic_embedding(topic_dir, topic_sem_dim)
+    return np.concatenate([topic_sem, stat_feat], axis=0).astype(np.float32)
+
+def build_global_graph(dataset_root: Path, video_dim: int, audio_dim: int, image_dim: int, text_dim: int, topic_sem_dim: int, max_topics: int = -1):
+    topic_dirs = sorted([p for p in dataset_root.iterdir() if p.is_dir()])
+    if max_topics > 0:
+        topic_dirs = topic_dirs[:max_topics]
+    user2idx: Dict[str, int] = {}
+    user_rows_dict: Dict[str, List[pd.Series]] = {}
+    topic_feats, post_feats, video_feats, image_feats, audio_feats, text_feats = [], [], [], [], [], []
+    labels, topic_names, topic_dirs_used, topic_meta, post_meta = [], [], [], [], []
+    edges = {k: ([], []) for k in [
+        "topic_has_post", "post_rev_topic", "post_video", "video_post", "post_audio", "audio_post", "post_text", "text_post", "post_user", "user_post", "post_image", "image_post"
+    ]}
+
+    for topic_dir in tqdm(topic_dirs, desc="Building one global heterogeneous graph"):
+        csv_path = find_topic_csv(topic_dir)
+        if csv_path is None:
+            continue
+        read_count = parse_popularity(topic_dir / "popularity.txt").get("阅读量", 0.0)
+        if read_count <= 0:
+            continue
+        df = safe_read_csv(csv_path)
+        if "id" not in df.columns or len(df) == 0:
+            continue
+        row_user_ids = get_user_ids(df)
+        topic_idx = len(topic_feats)
+        topic_feats.append(build_topic_feature(df, user_count=len(set(row_user_ids)), topic_dir=topic_dir, topic_sem_dim=topic_sem_dim))
+        labels.append(float(np.log10(read_count + 1.0)))
+        topic_names.append(normalize_topic_name(topic_dir.name))
+        topic_dirs_used.append(str(topic_dir))
+        topic_meta.append({"topic_idx": topic_idx, "topic_name": normalize_topic_name(topic_dir.name), "topic_dir": str(topic_dir), "csv_path": str(csv_path), "read_count": float(read_count), "num_posts": int(len(df)), "num_unique_users": int(len(set(row_user_ids)))})
+        if "entropy_score" in df.columns:
+            weights = minmax_norm_array(pd.to_numeric(df["entropy_score"], errors="coerce").fillna(0).values.astype(np.float32))
+        elif "post_weight" in df.columns:
+            weights = minmax_norm_array(pd.to_numeric(df["post_weight"], errors="coerce").fillna(0).values.astype(np.float32))
+        else:
+            weights = np.zeros(len(df), dtype=np.float32)
+        for row_i, (_, row) in enumerate(df.iterrows()):
+            post_id = str(row["id"])
+            user_id = row_user_ids[row_i]
+            if user_id not in user2idx:
+                user2idx[user_id] = len(user2idx)
+                user_rows_dict[user_id] = []
+            user_rows_dict[user_id].append(row)
+            user_idx = user2idx[user_id]
+            post_idx, video_idx, image_idx, audio_idx, text_idx = len(post_feats), len(video_feats), len(image_feats), len(audio_feats), len(text_feats)
+            post_feats.append(build_post_feature_from_row(row, float(weights[row_i])))
+            video_feats.append(build_video_feature(topic_dir, post_id, video_dim))
+            image_feats.append(build_image_feature(topic_dir, post_id, image_dim))
+            audio_feats.append(build_audio_feature(topic_dir, post_id, audio_dim))
+            text_feats.append(build_text_feature(topic_dir, post_id, text_dim))
+            for key, s, d in [
+                ("topic_has_post", topic_idx, post_idx), ("post_rev_topic", post_idx, topic_idx),
+                ("post_video", post_idx, video_idx), ("video_post", video_idx, post_idx),
+                ("post_audio", post_idx, audio_idx), ("audio_post", audio_idx, post_idx),
+                ("post_text", post_idx, text_idx), ("text_post", text_idx, post_idx),
+                ("post_user", post_idx, user_idx), ("user_post", user_idx, post_idx),
+("post_image", post_idx, image_idx), ("image_post", image_idx, post_idx),
+            ]:
+                edges[key][0].append(s); edges[key][1].append(d)
+            post_meta.append({"post_idx": post_idx, "topic_idx": topic_idx, "topic_name": normalize_topic_name(topic_dir.name), "post_id": post_id, "user_id": user_id, "user_idx": user_idx})
+    if not topic_feats:
+        raise RuntimeError("没有成功读取任何 topic。")
+    user_feats = [None] * len(user2idx)
+    for user_id, idx in user2idx.items():
+        user_feats[idx] = build_user_feature_from_rows(pd.DataFrame(user_rows_dict[user_id]))
+    topic_feats = np.vstack(topic_feats).astype(np.float32)
+    post_feats = np.vstack(post_feats).astype(np.float32)
+    video_feats = np.vstack(video_feats).astype(np.float32)
+    audio_feats = np.vstack(audio_feats).astype(np.float32)
+    text_feats = np.vstack(text_feats).astype(np.float32)
+    image_feats = np.vstack(image_feats).astype(np.float32)
+    user_feats = np.vstack(user_feats).astype(np.float32)
+    for col in range(1, topic_feats.shape[1]): topic_feats[:, col] = minmax_norm_array(topic_feats[:, col])
+    for col in range(1, post_feats.shape[1]): post_feats[:, col] = minmax_norm_array(post_feats[:, col])
+    def t(key): return (torch.tensor(edges[key][0], dtype=torch.int64), torch.tensor(edges[key][1], dtype=torch.int64))
+    g = dgl.heterograph({
+        ("topic", "has_post", "post"): t("topic_has_post"), ("post", "rev_has_post", "topic"): t("post_rev_topic"),
+        ("post", "has_video", "video"): t("post_video"), ("video", "rev_has_video", "post"): t("video_post"),
+        ("post", "has_audio", "audio"): t("post_audio"), ("audio", "rev_has_audio", "post"): t("audio_post"),
+        ("post", "has_text", "text"): t("post_text"), ("text", "rev_has_text", "post"): t("text_post"),
+        ("post", "posted_by", "user"): t("post_user"), ("user", "publishes", "post"): t("user_post"),
+("post", "has_image", "image"): t("post_image"), ("image", "rev_has_image", "post"): t("image_post"),
+    }, num_nodes_dict={"topic": len(topic_feats), "post": len(post_feats), "video": len(video_feats), "audio": len(audio_feats), "text": len(text_feats), "user": len(user_feats), "image": len(image_feats)})
+    for ntype, feat in {"topic": topic_feats, "post": post_feats, "video": video_feats, "audio": audio_feats, "text": text_feats, "user": user_feats, "image": image_feats}.items():
+        g.nodes[ntype].data["feat"] = torch.tensor(feat, dtype=torch.float32)
+    labels = torch.tensor(np.array(labels, dtype=np.float32)).unsqueeze(-1)
+    meta = {"num_topics": g.number_of_nodes("topic"), "num_posts": g.number_of_nodes("post"), "num_users": g.number_of_nodes("user"), "topic_names": topic_names, "topic_dirs": topic_dirs_used, "topic_meta": topic_meta, "post_meta": post_meta, "user2idx": user2idx, "input_dims": {ntype: int(g.nodes[ntype].data["feat"].shape[1]) for ntype in g.ntypes}, "canonical_etypes": [str(e) for e in g.canonical_etypes]}
+    return g, labels, meta

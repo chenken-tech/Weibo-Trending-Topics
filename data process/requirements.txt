@@ -1,0 +1,26 @@
+# 数据预处理 / 多模态向量化 / 熵权计算 依赖
+# 安装：pip install -r requirements.txt
+
+numpy
+pandas
+tqdm
+scipy
+
+# 多模态向量化
+torch
+transformers
+sentence-transformers
+Pillow
+opencv-python
+librosa
+soundfile
+
+# 文本工程（正文 + 视频 OCR + 语音识别）
+openai-whisper
+# paddleocr 与 paddlepaddle 体积较大，仅当需要视频关键帧 OCR 时安装：
+# paddleocr
+# paddlepaddle
+
+# 数据采集（Selenium 爬取热度/用户属性）
+selenium
+webdriver-manager

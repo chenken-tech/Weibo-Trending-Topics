@@ -1,0 +1,787 @@
+# -*- coding: utf-8 -*-
+"""
+train.py
+
+全局传播关系异构图版本：
+- 所有 topic/post/user/video/image/audio/text 放入一张全局异构图；
+- 同一个 user_id 只建一个 user 节点，可连接多个话题下的多个帖子；
+- 预测 topic 节点的 log10(阅读量 + 1)；
+- 保存模型参数、topic 节点表示、预测结果与训练日志。
+
+运行：
+python train.py --dataset_root "你的文件读取路径" --output_dir "你的文件输出路径" --cuda 0 --epochs 100 --hidden_dim 64 --num_heads 2 --dropout 0.5 --lr 1e-5
+"""
+
+import re
+import json
+import argparse
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl
+
+
+def clean_path(s: str) -> Path:
+    s = str(s).strip().replace("\ue000", "").replace("\ufeff", "")
+    return Path(s.strip('"').strip("'"))
+
+
+def set_random_seed(seed: int = 42):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    dgl.random.seed(seed)
+
+
+def safe_read_csv(csv_path: Path) -> pd.DataFrame:
+    for enc in ["utf-8-sig", "utf-8", "gbk", "gb18030"]:
+        try:
+            return pd.read_csv(csv_path, encoding=enc)
+        except Exception:
+            pass
+    return pd.read_csv(csv_path)
+
+
+def parse_popularity(pop_path: Path) -> Dict[str, float]:
+    result = {}
+    if not pop_path.exists():
+        return result
+    text = pop_path.read_text(encoding="utf-8", errors="ignore")
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "：" in line:
+            k, v = line.split("：", 1)
+        elif ":" in line:
+            k, v = line.split(":", 1)
+        else:
+            continue
+        v = re.sub(r"[^\d.]", "", v)
+        result[k.strip()] = float(v) if v else 0.0
+    return result
+
+
+def normalize_topic_name(name: str) -> str:
+    return name.replace("%23", "#")
+
+
+def find_topic_csv(topic_dir: Path) -> Optional[Path]:
+    entropy_csv = topic_dir / "entropy_selected.csv"
+    if entropy_csv.exists():
+        return entropy_csv
+    csvs = list(topic_dir.glob("*.csv"))
+    if not csvs:
+        return None
+    raw = [p for p in csvs if
+           "_scored" not in p.name and "_selected" not in p.name and "entropy_selected" not in p.name]
+    return raw[0] if raw else csvs[0]
+
+
+def to_numeric_series(df: pd.DataFrame, col_candidates: List[str], default=0.0) -> pd.Series:
+    for col in col_candidates:
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors="coerce").fillna(default).astype(float)
+    return pd.Series(np.full(len(df), default), index=df.index, dtype=float)
+
+
+def log1p_norm(x: pd.Series) -> np.ndarray:
+    x = pd.to_numeric(x, errors="coerce").fillna(0).clip(lower=0).astype(float)
+    y = np.log1p(x)
+    mn, mx = y.min(), y.max()
+    if mx - mn < 1e-12:
+        return np.zeros(len(y), dtype=np.float32)
+    return ((y - mn) / (mx - mn)).astype(np.float32).values
+
+
+def minmax_norm_array(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32)
+    if len(x) == 0:
+        return x
+    mn, mx = float(np.min(x)), float(np.max(x))
+    if mx - mn < 1e-12:
+        return np.zeros_like(x, dtype=np.float32)
+    return ((x - mn) / (mx - mn)).astype(np.float32)
+
+
+def minmax_norm(x: pd.Series) -> np.ndarray:
+    x = pd.to_numeric(x, errors="coerce").fillna(0).astype(float)
+    return minmax_norm_array(x.values)
+
+
+def auth_to_id(x) -> int:
+    if pd.isna(x):
+        return 0
+    s = str(x).strip()
+    mapping = {"": 0, "nan": 0, "None": 0, "普通用户": 0, "黄V": 1, "红V": 2, "蓝V": 3, "金V": 4,
+               "微博个人认证": 1, "个人认证": 1, "微博机构认证": 3, "机构认证": 3, "微博官方认证": 3, "官方认证": 3,
+               "蓝V认证": 3}
+    return mapping.get(s, 5)
+
+
+def member_type_to_id(x) -> int:
+    if pd.isna(x):
+        return 0
+    s = str(x).strip()
+    mapping = {"": 0, "nan": 0, "None": 0, "非会员": 0, "会员": 1, "超级会员": 2}
+    return mapping.get(s, 3)
+
+
+def one_hot(ids: np.ndarray, num_classes: int) -> np.ndarray:
+    ids = np.asarray(ids, dtype=np.int64)
+    ids = np.clip(ids, 0, num_classes - 1)
+    out = np.zeros((len(ids), num_classes), dtype=np.float32)
+    out[np.arange(len(ids)), ids] = 1.0
+    return out
+
+
+def make_fixed_dim(vec: Optional[np.ndarray], dim: int) -> np.ndarray:
+    if vec is None:
+        return np.zeros(dim, dtype=np.float32)
+    vec = np.asarray(vec, dtype=np.float32).reshape(-1)
+    if len(vec) == dim:
+        return vec
+    if len(vec) > dim:
+        return vec[:dim]
+    out = np.zeros(dim, dtype=np.float32)
+    out[:len(vec)] = vec
+    return out
+
+
+def load_npy_by_post_id(folder: Path, post_id: str) -> Optional[np.ndarray]:
+    if not folder.exists():
+        return None
+    candidates = [folder / f"{post_id}.npy"]
+    try:
+        candidates.append(folder / f"{int(float(post_id))}.npy")
+    except Exception:
+        pass
+    for p in candidates:
+        if p.exists():
+            try:
+                return np.asarray(np.load(p), dtype=np.float32).reshape(-1)
+            except Exception:
+                return None
+    return None
+
+
+def infer_embedding_dim(topic_dirs: List[Path], folder_names: List[str], fallback_dim: int) -> int:
+    for td in topic_dirs:
+        for fn in folder_names:
+            folder = td / fn
+            if folder.exists():
+                files = list(folder.glob("*.npy"))
+                if files:
+                    try:
+                        return int(np.load(files[0]).reshape(-1).shape[0])
+                    except Exception:
+                        pass
+    return fallback_dim
+
+
+def infer_topic_embedding_dim(topic_dirs: List[Path], fallback_dim: int = 768) -> int:
+    """
+    自动推断话题语义向量维度。
+    支持：
+    1. topic_dir/topic_embedding.npy
+    2. topic_dir/topicembedding.npy
+    3. topic_dir/topic_semantic.npy
+    """
+    for td in topic_dirs:
+        for name in ["topic_embedding.npy", "topicembedding.npy", "topic_semantic.npy"]:
+            f = td / name
+            if f.exists():
+                try:
+                    return int(np.load(f).reshape(-1).shape[0])
+                except Exception:
+                    pass
+    return fallback_dim
+
+
+def load_topic_embedding(topic_dir: Path, topic_sem_dim: int) -> np.ndarray:
+    """读取每个话题文件夹下的话题语义 embedding。没有则补 0。"""
+    for name in ["topic_embedding.npy", "topicembedding.npy", "topic_semantic.npy"]:
+        f = topic_dir / name
+        if f.exists():
+            try:
+                return make_fixed_dim(np.load(f), topic_sem_dim)
+            except Exception:
+                pass
+    return make_fixed_dim(None, topic_sem_dim)
+
+
+def get_user_ids(df: pd.DataFrame) -> List[str]:
+    for col in ["user_id", "用户id", "用户ID", "用户昵称", "昵称"]:
+        if col in df.columns:
+            return df[col].fillna("unknown").astype(str).tolist()
+    return [f"user_{i}" for i in range(len(df))]
+
+
+def build_video_feature(topic_dir: Path, post_id: str, video_dim: int) -> np.ndarray:
+    return make_fixed_dim(load_npy_by_post_id(topic_dir / "videoembedding", post_id), video_dim)
+
+
+def build_image_feature(topic_dir: Path, post_id: str, image_dim: int) -> np.ndarray:
+    """图片模态节点特征：<话题>/imageembedding/<帖子id>.npy（ViT CLS 768 维，多图平均融合）。"""
+    return make_fixed_dim(load_npy_by_post_id(topic_dir / "imageembedding", post_id), image_dim)
+
+
+def build_audio_feature(topic_dir: Path, post_id: str, audio_dim: int) -> np.ndarray:
+    return make_fixed_dim(load_npy_by_post_id(topic_dir / "audioembedding", post_id), audio_dim)
+
+
+def build_text_feature(topic_dir: Path, post_id: str, text_dim: int) -> np.ndarray:
+    vec = None
+    for fn in ["textembedding", "text_embeddings", "bertembedding", "contextembedding"]:
+        vec = load_npy_by_post_id(topic_dir / fn, post_id)
+        if vec is not None:
+            break
+    return make_fixed_dim(vec, text_dim)
+
+def build_post_feature_from_row(row: pd.Series, post_weight: float = 0.0) -> np.ndarray:
+    def has_non_empty(names):
+        for name in names:
+            if name in row.index:
+                s = str(row[name]).strip()
+                if s not in ["", "nan", "None", "NaN"]:
+                    return 1.0
+        return 0.0
+
+    def get_text_len(names):
+        for name in names:
+            if name in row.index:
+                return float(len(str(row[name])))
+        return 0.0
+
+    has_video = has_non_empty(["微博视频url", "video_url", "视频url"])
+    has_image = has_non_empty(["微博图片url", "image_url", "图片url"])
+    text_len_raw = get_text_len(["微博正文", "正文", "content", "text"])
+    has_text = 1.0 if text_len_raw > 0 else 0.0
+    return np.array([1.0, float(post_weight), has_video, has_image, has_text, np.log1p(text_len_raw)], dtype=np.float32)
+
+
+def build_user_feature_from_rows(user_rows: pd.DataFrame) -> np.ndarray:
+    follow = float(np.mean(log1p_norm(
+        to_numeric_series(user_rows, ["关注数", "关注", "follow_count", "friends_count", "用户关注数"])))) if len(
+        user_rows) else 0.0
+    fans = float(np.mean(log1p_norm(
+        to_numeric_series(user_rows, ["粉丝数", "粉丝", "followers_count", "followers", "用户粉丝数"])))) if len(
+        user_rows) else 0.0
+    user_reposts = float(np.mean(log1p_norm(
+        to_numeric_series(user_rows, ["用户转发数", "user_repost_count", "博主转发数", "主页转发数"])))) if len(
+        user_rows) else 0.0
+    user_comments = float(np.mean(log1p_norm(
+        to_numeric_series(user_rows, ["用户评论数", "user_comment_count", "博主评论数", "主页评论数"])))) if len(
+        user_rows) else 0.0
+    user_likes = float(np.mean(log1p_norm(
+        to_numeric_series(user_rows, ["用户点赞数", "user_like_count", "博主点赞数", "主页点赞数"])))) if len(
+        user_rows) else 0.0
+    if "user_authentication" in user_rows.columns:
+        auth_id = auth_to_id(user_rows["user_authentication"].iloc[0])
+    elif "认证" in user_rows.columns:
+        auth_id = auth_to_id(user_rows["认证"].iloc[0])
+    else:
+        auth_id = 0
+    if "会员类型" in user_rows.columns:
+        member_id = member_type_to_id(user_rows["会员类型"].iloc[0])
+    elif "会员" in user_rows.columns:
+        member_id = member_type_to_id(user_rows["会员"].iloc[0])
+    else:
+        member_id = 0
+    vip = float(np.mean(minmax_norm(to_numeric_series(user_rows, ["会员等级", "vip_level", "用户会员等级"])))) if len(
+        user_rows) else 0.0
+    base = np.array([follow, fans, user_reposts, user_comments, user_likes, vip], dtype=np.float32)
+    return np.concatenate([base, one_hot(np.array([auth_id]), 6)[0], one_hot(np.array([member_id]), 4)[0]],
+                          axis=0).astype(np.float32)
+
+
+def build_topic_feature(df: pd.DataFrame, user_count: int, topic_dir: Path, topic_sem_dim: int) -> np.ndarray:
+    post_count = len(df)
+    if "entropy_score" in df.columns:
+        post_weight = pd.to_numeric(df["entropy_score"], errors="coerce").fillna(0).values.astype(np.float32)
+    elif "post_weight" in df.columns:
+        post_weight = pd.to_numeric(df["post_weight"], errors="coerce").fillna(0).values.astype(np.float32)
+    else:
+        post_weight = np.zeros(post_count, dtype=np.float32)
+    post_weight_norm = minmax_norm_array(post_weight) if len(post_weight) else post_weight
+    mean_weight = float(np.mean(post_weight_norm)) if len(post_weight_norm) else 0.0
+    max_weight = float(np.max(post_weight_norm)) if len(post_weight_norm) else 0.0
+    std_weight = float(np.std(post_weight_norm)) if len(post_weight_norm) else 0.0
+    repost = to_numeric_series(df, ["转发数", "reposts", "repost_count"])
+    comment = to_numeric_series(df, ["评论数", "comments", "comment_count"])
+    like = to_numeric_series(df, ["点赞数", "likes", "like_count"])
+    avg_text_len = float(
+        np.log1p(df["微博正文"].fillna("").astype(str).apply(len).mean())) if "微博正文" in df.columns else 0.0
+    stat_feat = np.array([1.0, np.log1p(post_count), np.log1p(user_count), mean_weight, max_weight, std_weight,
+                          float(np.log1p(repost.clip(lower=0).mean())), float(np.log1p(comment.clip(lower=0).mean())),
+                          float(np.log1p(like.clip(lower=0).mean())),
+                          float(np.log1p(repost.clip(lower=0).max())), float(np.log1p(comment.clip(lower=0).max())),
+                          float(np.log1p(like.clip(lower=0).max())),
+                          avg_text_len, float((repost > 0).mean()) if len(repost) else 0.0,
+                          float((comment > 0).mean()) if len(comment) else 0.0], dtype=np.float32)
+    topic_sem = load_topic_embedding(topic_dir, topic_sem_dim)
+    # topic 节点最终特征 = 话题语义 embedding + 15维结构统计特征
+    return np.concatenate([topic_sem, stat_feat], axis=0).astype(np.float32)
+
+
+def build_global_graph(dataset_root: Path, video_dim: int, audio_dim: int, image_dim: int, text_dim: int, topic_sem_dim: int,
+                       max_topics: int = -1):
+    topic_dirs = sorted([p for p in dataset_root.iterdir() if p.is_dir()])
+    if max_topics > 0:
+        topic_dirs = topic_dirs[:max_topics]
+    user2idx: Dict[str, int] = {}
+    user_rows_dict: Dict[str, List[pd.Series]] = {}
+    topic_feats, post_feats, video_feats, image_feats, audio_feats, text_feats = [], [], [], [], [], []
+    labels, topic_names, topic_dirs_used, topic_meta, post_meta = [], [], [], [], []
+
+    # ========== 新增：存储每个帖子的熵权，用于后续添加到图中 ==========
+    post_entropy_weights = []
+
+    edges = {k: ([], []) for k in [
+        "topic_has_post", "post_rev_topic", "post_video", "video_post", "post_image", "image_post", "post_audio", "audio_post", "post_text",
+        "text_post", "post_user", "user_post"
+    ]}
+
+    for topic_dir in tqdm(topic_dirs, desc="Building one global heterogeneous graph"):
+        csv_path = find_topic_csv(topic_dir)
+        if csv_path is None:
+            continue
+        read_count = parse_popularity(topic_dir / "popularity.txt").get("阅读量", 0.0)
+        if read_count <= 0:
+            continue
+        df = safe_read_csv(csv_path)
+        if "id" not in df.columns or len(df) == 0:
+            continue
+        row_user_ids = get_user_ids(df)
+        topic_idx = len(topic_feats)
+        topic_feats.append(build_topic_feature(df, user_count=len(set(row_user_ids)), topic_dir=topic_dir,
+                                               topic_sem_dim=topic_sem_dim))
+        labels.append(float(np.log10(read_count + 1.0)))
+        topic_names.append(normalize_topic_name(topic_dir.name))
+        topic_dirs_used.append(str(topic_dir))
+        topic_meta.append(
+            {"topic_idx": topic_idx, "topic_name": normalize_topic_name(topic_dir.name), "topic_dir": str(topic_dir),
+             "csv_path": str(csv_path), "read_count": float(read_count), "num_posts": int(len(df)),
+             "num_unique_users": int(len(set(row_user_ids)))})
+        if "entropy_score" in df.columns:
+            weights = minmax_norm_array(
+                pd.to_numeric(df["entropy_score"], errors="coerce").fillna(0).values.astype(np.float32))
+        elif "post_weight" in df.columns:
+            weights = minmax_norm_array(
+                pd.to_numeric(df["post_weight"], errors="coerce").fillna(0).values.astype(np.float32))
+        else:
+            weights = np.zeros(len(df), dtype=np.float32)
+        for row_i, (_, row) in enumerate(df.iterrows()):
+            post_id = str(row["id"])
+            user_id = row_user_ids[row_i]
+            if user_id not in user2idx:
+                user2idx[user_id] = len(user2idx)
+                user_rows_dict[user_id] = []
+            user_rows_dict[user_id].append(row)
+            user_idx = user2idx[user_id]
+            image_idx = len(image_feats)
+            post_idx, video_idx, audio_idx, text_idx = len(post_feats), len(video_feats), len(audio_feats), len(text_feats)
+            post_feats.append(build_post_feature_from_row(row, float(weights[row_i])))
+
+            # ========== 新增：保存该帖子的熵权 ==========
+            post_entropy_weights.append(float(weights[row_i]))
+
+            video_feats.append(build_video_feature(topic_dir, post_id, video_dim))
+            image_feats.append(build_image_feature(topic_dir, post_id, image_dim))
+            audio_feats.append(build_audio_feature(topic_dir, post_id, audio_dim))
+            text_feats.append(build_text_feature(topic_dir, post_id, text_dim))
+            for key, s, d in [
+                ("topic_has_post", topic_idx, post_idx), ("post_rev_topic", post_idx, topic_idx),
+                ("post_video", post_idx, video_idx), ("video_post", video_idx, post_idx), ("post_image", post_idx, image_idx), ("image_post", image_idx, post_idx),
+                ("post_audio", post_idx, audio_idx), ("audio_post", audio_idx, post_idx),
+                ("post_text", post_idx, text_idx), ("text_post", text_idx, post_idx),
+                ("post_user", post_idx, user_idx), ("user_post", user_idx, post_idx),
+            ]:
+                edges[key][0].append(s);
+                edges[key][1].append(d)
+            post_meta.append(
+                {"post_idx": post_idx, "topic_idx": topic_idx, "topic_name": normalize_topic_name(topic_dir.name),
+                 "post_id": post_id, "user_id": user_id, "user_idx": user_idx})
+    if not topic_feats:
+        raise RuntimeError("没有成功读取任何 topic。")
+    user_feats = [None] * len(user2idx)
+    for user_id, idx in user2idx.items():
+        user_feats[idx] = build_user_feature_from_rows(pd.DataFrame(user_rows_dict[user_id]))
+    topic_feats = np.vstack(topic_feats).astype(np.float32)
+    post_feats = np.vstack(post_feats).astype(np.float32)
+    video_feats = np.vstack(video_feats).astype(np.float32)
+    image_feats = np.vstack(image_feats).astype(np.float32)
+    audio_feats = np.vstack(audio_feats).astype(np.float32)
+    text_feats = np.vstack(text_feats).astype(np.float32)
+    user_feats = np.vstack(user_feats).astype(np.float32)
+    for col in range(1, topic_feats.shape[1]): topic_feats[:, col] = minmax_norm_array(topic_feats[:, col])
+    for col in range(1, post_feats.shape[1]): post_feats[:, col] = minmax_norm_array(post_feats[:, col])
+
+    def t(key):
+        return (torch.tensor(edges[key][0], dtype=torch.int64), torch.tensor(edges[key][1], dtype=torch.int64))
+
+    g = dgl.heterograph({
+        ("topic", "has_post", "post"): t("topic_has_post"), ("post", "rev_has_post", "topic"): t("post_rev_topic"),
+        ("post", "has_video", "video"): t("post_video"), ("video", "rev_has_video", "post"): t("video_post"), ("post", "has_image", "image"): t("post_image"), ("image", "rev_has_image", "post"): t("image_post"),
+        ("post", "has_audio", "audio"): t("post_audio"), ("audio", "rev_has_audio", "post"): t("audio_post"),
+        ("post", "has_text", "text"): t("post_text"), ("text", "rev_has_text", "post"): t("text_post"),
+        ("post", "posted_by", "user"): t("post_user"), ("user", "publishes", "post"): t("user_post"),
+    }, num_nodes_dict={"topic": len(topic_feats), "post": len(post_feats), "video": len(video_feats), "image": len(image_feats),
+                       "audio": len(audio_feats), "text": len(text_feats), "user": len(user_feats)})
+    for ntype, feat in {"topic": topic_feats, "post": post_feats, "video": video_feats, "image": image_feats, "audio": audio_feats,
+                        "text": text_feats, "user": user_feats}.items():
+        g.nodes[ntype].data["feat"] = torch.tensor(feat, dtype=torch.float32)
+
+    # ========== 新增：将帖子的熵权作为节点属性添加到图中 ==========
+    g.nodes['post'].data["entropy_weight"] = torch.tensor(np.array(post_entropy_weights, dtype=np.float32),
+                                                          dtype=torch.float32).unsqueeze(-1)
+
+    labels = torch.tensor(np.array(labels, dtype=np.float32)).unsqueeze(-1)
+    meta = {"num_topics": g.number_of_nodes("topic"), "num_posts": g.number_of_nodes("post"),
+            "num_users": g.number_of_nodes("user"), "topic_names": topic_names, "topic_dirs": topic_dirs_used,
+            "topic_meta": topic_meta, "post_meta": post_meta, "user2idx": user2idx,
+            "input_dims": {ntype: int(g.nodes[ntype].data["feat"].shape[1]) for ntype in g.ntypes},
+            "canonical_etypes": [str(e) for e in g.canonical_etypes]}
+    return g, labels, meta
+
+
+try:
+    from HetSANN import HetSANN
+except Exception as e:
+    HetSANN = None
+    HETSANN_IMPORT_ERROR = e
+
+
+class GlobalTopicRegressor(nn.Module):
+    def __init__(self, graph, input_dim_dict, hidden_dim=64, n_layers=2, n_heads=2, dropout=0.5):
+        super().__init__()
+        if HetSANN is None:
+            raise ImportError(f"无法导入 HetSANN.py：{HETSANN_IMPORT_ERROR}")
+        self.encoder = HetSANN(graph=graph, input_dim_dict=input_dim_dict, hidden_dim=hidden_dim, num_layers=n_layers,
+                               n_heads=n_heads, dropout=dropout, residual=True)
+        out_dim = hidden_dim * n_heads
+        self.regressor = nn.Sequential(
+            nn.Linear(out_dim, out_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(out_dim, 1)
+        )
+
+    # ========== 修改：encode 方法增加 entropy_weights 参数 ==========
+    def encode(self, g, device, entropy_weights=None):
+        node_features = {ntype: g.nodes[ntype].data["feat"].to(device) for ntype in g.ntypes}
+        blocks = [g.to(device) for _ in range(self.encoder.num_layers)]
+        return self.encoder(blocks, node_features, entropy_weights=entropy_weights)
+
+    # ========== 修改：forward 方法获取帖子熵权并传递给 encode ==========
+    def forward(self, g, device):
+        # 获取帖子节点的熵权先验（从图的节点属性中读取）
+        entropy_weights = None
+        if 'entropy_weight' in g.nodes['post'].data:
+            entropy_weights = {'post': g.nodes['post'].data['entropy_weight'].to(device)}
+
+        h = self.encode(g, device, entropy_weights=entropy_weights)
+        pred = self.regressor(h["topic"])
+        return pred, h
+
+
+def split_indices(n, train_ratio=0.7, val_ratio=0.15, seed=42):
+    rng = np.random.default_rng(seed)
+    idx = np.arange(n);
+    rng.shuffle(idx)
+    n_train, n_val = int(n * train_ratio), int(n * val_ratio)
+    return torch.tensor(idx[:n_train]), torch.tensor(idx[n_train:n_train + n_val]), torch.tensor(idx[n_train + n_val:])
+
+
+@torch.no_grad()
+def evaluate(model, graph, labels, indices, device):
+    model.eval()
+    pred, _ = model(graph, device)
+    labels = labels.to(device);
+    indices = indices.to(device)
+    y = labels[indices].squeeze(-1);
+    p = pred[indices].squeeze(-1)
+    loss = F.mse_loss(p, y)
+    ys, ps = y.cpu().numpy().astype(np.float32), p.cpu().numpy().astype(np.float32)
+    mae = float(np.mean(np.abs(ys - ps))) if len(ys) else 0.0
+    rmse = float(np.sqrt(np.mean((ys - ps) ** 2))) if len(ys) else 0.0
+    nmse = float(np.mean((ys - ps) ** 2) / (np.std(ys) ** 2 + 1e-12)) if len(ys) > 1 and np.std(ys) > 1e-12 else 0.0
+    mask = ys != 0
+    mape = float(np.mean(np.abs((ys[mask] - ps[mask]) / (ys[mask] + 1e-12)))) if mask.sum() > 0 else 0.0
+    r2 = float(1.0 - np.sum((ys - ps) ** 2) / np.sum((ys - ys.mean()) ** 2)) if len(ys) > 1 and np.var(
+        ys) > 1e-12 else 0.0
+    return {"loss": float(loss.item()), "MAE": mae, "RMSE": rmse, "nMSE": nmse, "MAPE": mape, "R2": r2,
+            "y_true": ys.tolist(), "y_pred": ps.tolist()}
+
+
+@torch.no_grad()
+def save_outputs(model, graph, labels, meta, output_dir, device):
+    model.eval()
+    pred, h = model(graph, device)
+    topic_emb = h["topic"].cpu().numpy().astype(np.float32)
+    topic_pred = pred.cpu().numpy().astype(np.float32).reshape(-1)
+    topic_label = labels.cpu().numpy().astype(np.float32).reshape(-1)
+    np.save(output_dir / "topic_node_embeddings.npy", topic_emb)
+    np.save(output_dir / "topic_pred_log10_read.npy", topic_pred)
+    np.save(output_dir / "topic_label_log10_read.npy", topic_label)
+    emb_dir = output_dir / "node_embeddings";
+    emb_dir.mkdir(parents=True, exist_ok=True)
+    for ntype in h:
+        np.save(emb_dir / f"{ntype}_embeddings.npy", h[ntype].cpu().numpy().astype(np.float32))
+    pd.DataFrame([{"topic_idx": i, "topic_name": name, "label_log10_read": float(topic_label[i]),
+                   "pred_log10_read": float(topic_pred[i]), "abs_error": float(abs(topic_label[i] - topic_pred[i]))} for
+                  i, name in enumerate(meta["topic_names"])]).to_csv(output_dir / "topic_predictions.csv", index=False,
+                                                                     encoding="utf-8-sig")
+
+
+
+def _metric_dict_without_arrays(result: dict) -> dict:
+    """Remove prediction arrays from an evaluation result before logging."""
+    return {k: v for k, v in result.items() if k not in ["y_true", "y_pred"]}
+
+
+def _parse_seed_list(seed_text: str, num_runs: int, base_seed: int) -> List[int]:
+    """Parse comma-separated seeds; if absent/short, complete from base_seed."""
+    if seed_text:
+        seeds = [int(x.strip()) for x in seed_text.split(',') if x.strip() != '']
+    else:
+        seeds = []
+    if len(seeds) < num_runs:
+        used = set(seeds)
+        s = base_seed
+        while len(seeds) < num_runs:
+            if s not in used:
+                seeds.append(s)
+                used.add(s)
+            s += 1
+    return seeds[:num_runs]
+
+
+def _summarize_runs(run_rows: List[dict], output_dir: Path) -> dict:
+    """Save per-run results and mean/std summaries."""
+    df = pd.DataFrame(run_rows)
+    df.to_csv(output_dir / "five_split_results.csv", index=False, encoding="utf-8-sig")
+
+    metric_cols = [
+        c for c in df.columns
+        if any(c.startswith(prefix) for prefix in ["train_", "val_", "test_"])
+        and c not in ["train_loss", "val_loss", "test_loss"]
+    ]
+    summary_rows = []
+    summary = {}
+    for col in metric_cols:
+        vals = pd.to_numeric(df[col], errors="coerce")
+        mean = float(vals.mean())
+        std = float(vals.std(ddof=1)) if len(vals.dropna()) > 1 else 0.0
+        summary[col] = {"mean": mean, "std": std}
+        summary_rows.append({"metric": col, "mean": mean, "std": std})
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv(output_dir / "five_split_mean_std.csv", index=False, encoding="utf-8-sig")
+
+    with open(output_dir / "five_split_summary.json", "w", encoding="utf-8") as f:
+        json.dump({"runs": run_rows, "summary": summary}, f, ensure_ascii=False, indent=2)
+
+    return summary
+
+
+def train_one_split(args, graph, labels, meta, device: str, seed: int, run_id: int) -> dict:
+    """Train and evaluate one random split with a fixed seed."""
+    set_random_seed(seed)
+
+    run_dir = clean_path(args.output_dir) / f"run_{run_id:02d}_seed_{seed}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    train_idx, val_idx, test_idx = split_indices(graph.number_of_nodes("topic"), seed=seed)
+    with open(run_dir / "split_indices.json", "w", encoding="utf-8") as f:
+        json.dump({
+            "seed": seed,
+            "train_idx": train_idx.tolist(),
+            "val_idx": val_idx.tolist(),
+            "test_idx": test_idx.tolist()
+        }, f, ensure_ascii=False, indent=2)
+
+    model = GlobalTopicRegressor(
+        graph,
+        {ntype: int(graph.nodes[ntype].data["feat"].shape[1]) for ntype in graph.ntypes},
+        args.hidden_dim,
+        args.n_layers,
+        args.num_heads,
+        args.dropout
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    best_val, patience_counter, history = float("inf"), 0, []
+    best_path = run_dir / "Global_HetSANN_weibo_topic_best.pkl"
+    labels_device = labels.to(device)
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        pred, _ = model(graph, device)
+        y_train = labels_device[train_idx.to(device)].squeeze(-1)
+        p_train = pred[train_idx.to(device)].squeeze(-1)
+        loss = F.mse_loss(p_train, y_train)
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+
+        val_result = evaluate(model, graph, labels, val_idx, device)
+        test_result = evaluate(model, graph, labels, test_idx, device)
+
+        row = {
+            "run_id": run_id,
+            "seed": seed,
+            "epoch": epoch,
+            "train_loss": float(loss.item()),
+            **{f"val_{k}": v for k, v in val_result.items() if k not in ["y_true", "y_pred"]},
+            **{f"test_{k}": v for k, v in test_result.items() if k not in ["y_true", "y_pred"]},
+        }
+        history.append(row)
+
+        print(
+            f"[Run {run_id:02d} | seed={seed} | Epoch {epoch:03d}] "
+            f"train_loss={loss.item():.4f} | "
+            f"val_MAE={val_result['MAE']:.4f}, val_RMSE={val_result['RMSE']:.4f}, "
+            f"val_nMSE={val_result['nMSE']:.4f}, val_MAPE={val_result['MAPE']:.4f}, val_R2={val_result['R2']:.4f} | "
+            f"test_MAE={test_result['MAE']:.4f}, test_RMSE={test_result['RMSE']:.4f}, "
+            f"test_nMSE={test_result['nMSE']:.4f}, test_MAPE={test_result['MAPE']:.4f}, test_R2={test_result['R2']:.4f}"
+        )
+
+        if val_result["loss"] < best_val:
+            best_val, patience_counter = val_result["loss"], 0
+            torch.save(model.state_dict(), best_path)
+        else:
+            patience_counter += 1
+
+        if patience_counter >= args.patience:
+            print(f"[Run {run_id:02d}] Early stopping at epoch {epoch}.")
+            break
+
+    with open(run_dir / "train_history_global_hetero.json", "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+    model.load_state_dict(torch.load(best_path, map_location=device))
+    final_train = evaluate(model, graph, labels, train_idx, device)
+    final_val = evaluate(model, graph, labels, val_idx, device)
+    final_test = evaluate(model, graph, labels, test_idx, device)
+
+    final_result = {
+        "run_id": run_id,
+        "seed": seed,
+        "train": _metric_dict_without_arrays(final_train),
+        "val": _metric_dict_without_arrays(final_val),
+        "test": _metric_dict_without_arrays(final_test),
+        "best_model_path": str(best_path)
+    }
+    with open(run_dir / "final_result_global_hetero.json", "w", encoding="utf-8") as f:
+        json.dump(final_result, f, ensure_ascii=False, indent=2)
+
+    if args.save_each_run_outputs:
+        save_outputs(model, graph, labels, meta, run_dir, device)
+
+    flat_row = {"run_id": run_id, "seed": seed, "best_model_path": str(best_path)}
+    flat_row.update({f"train_{k}": v for k, v in _metric_dict_without_arrays(final_train).items()})
+    flat_row.update({f"val_{k}": v for k, v in _metric_dict_without_arrays(final_val).items()})
+    flat_row.update({f"test_{k}": v for k, v in _metric_dict_without_arrays(final_test).items()})
+    return flat_row
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset_root", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--cuda", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42, help="Base seed. Used to build default seed list if --seeds is not provided.")
+    parser.add_argument("--seeds", type=str, default="42,43,44,45,46", help="Comma-separated seeds for repeated random splits.")
+    parser.add_argument("--num_runs", type=int, default=5, help="Number of random splits to run.")
+    parser.add_argument("--hidden_dim", type=int, default=64)
+    parser.add_argument("--num_heads", type=int, default=2)
+    parser.add_argument("--n_layers", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.4)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-5)
+    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--video_dim", type=int, default=768)
+    parser.add_argument("--image_dim", type=int, default=768, help="图片 embedding 维度（ViT CLS = 768）")
+    parser.add_argument("--audio_dim", type=int, default=512)
+    parser.add_argument("--text_dim", type=int, default=768)
+    parser.add_argument("--topic_sem_dim", type=int, default=768, help="topic_embedding.npy 的默认维度")
+    parser.add_argument("--max_topics", type=int, default=-1)
+    parser.add_argument("--save_each_run_outputs", action="store_true", help="Save embeddings and predictions for every split. This can take more disk space.")
+    args = parser.parse_args()
+
+    # Build graph once. Split and model initialization will be repeated with each seed.
+    set_random_seed(args.seed)
+    dataset_root, output_dir = clean_path(args.dataset_root), clean_path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = f"cuda:{args.cuda}" if torch.cuda.is_available() and args.cuda >= 0 else "cpu"
+    print(f"Using device: {device}")
+    print("dataset_root =", repr(str(dataset_root)))
+    if not dataset_root.exists():
+        raise FileNotFoundError(f"dataset_root 不存在：{dataset_root}")
+
+    topic_dirs = sorted([p for p in dataset_root.iterdir() if p.is_dir()])
+    video_dim = infer_embedding_dim(topic_dirs, ["videoembedding"], args.video_dim)
+    image_dim = infer_embedding_dim(topic_dirs, ["imageembedding"], args.image_dim)
+    audio_dim = infer_embedding_dim(topic_dirs, ["audioembedding"], args.audio_dim)
+    text_dim = infer_embedding_dim(topic_dirs, ["textembedding", "text_embeddings", "bertembedding", "contextembedding"], args.text_dim)
+    topic_sem_dim = infer_topic_embedding_dim(topic_dirs, args.topic_sem_dim)
+    print(f"Inferred dims: video={video_dim}, audio={audio_dim}, image={image_dim}, text={text_dim}, topic_sem={topic_sem_dim}")
+
+    graph, labels, meta = build_global_graph(dataset_root, video_dim, audio_dim, image_dim, text_dim, topic_sem_dim, args.max_topics)
+    print("Global graph built.")
+    print("Node counts:", {ntype: graph.number_of_nodes(ntype) for ntype in graph.ntypes})
+    print("Input dims:", meta["input_dims"])
+    print(f"Label range: min={labels.min().item():.4f}, max={labels.max().item():.4f}, mean={labels.mean().item():.4f}")
+
+    with open(output_dir / "global_graph_meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    seeds = _parse_seed_list(args.seeds, args.num_runs, args.seed)
+    with open(output_dir / "five_split_config.json", "w", encoding="utf-8") as f:
+        json.dump({
+            "num_runs": args.num_runs,
+            "seeds": seeds,
+            "train_val_test_ratio": "0.7/0.15/0.15",
+            "epochs": args.epochs,
+            "hidden_dim": args.hidden_dim,
+            "num_heads": args.num_heads,
+            "n_layers": args.n_layers,
+            "dropout": args.dropout,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "patience": args.patience,
+        }, f, ensure_ascii=False, indent=2)
+
+    run_rows = []
+    for run_id, seed in enumerate(seeds, start=1):
+        row = train_one_split(args, graph, labels, meta, device, seed=seed, run_id=run_id)
+        run_rows.append(row)
+
+    summary = _summarize_runs(run_rows, output_dir)
+
+    print("\n===== Five random splits summary: mean ± std =====")
+    for metric in ["test_MAE", "test_RMSE", "test_nMSE", "test_MAPE", "test_R2"]:
+        if metric in summary:
+            print(f"{metric}: {summary[metric]['mean']:.6f} ± {summary[metric]['std']:.6f}")
+    print(f"\nSaved per-run results: {output_dir / 'five_split_results.csv'}")
+    print(f"Saved mean/std summary: {output_dir / 'five_split_mean_std.csv'}")
+    print(f"Saved full summary JSON: {output_dir / 'five_split_summary.json'}")
+
+
+if __name__ == "__main__":
+    main()
